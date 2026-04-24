@@ -39,12 +39,55 @@ param(
     [string]$Sni,
 
     [ValidateSet("Tls", "Tls11", "Tls12", "Tls13", "Default")]
-    [string]$Protocol = "Default"
+    [string]$Protocol = "Default",
+
+    [ValidateRange(1, 60)]
+    [int]$ConnectTimeoutSeconds = 10,
+
+    [string]$OutputDir = ".\\logs",
+
+    [switch]$StrictValidation
 )
 
 $ErrorActionPreference = 'Stop'
 
 if (-not $Sni) { $Sni = $HostName }
+
+if ([System.IO.Path]::IsPathRooted($OutputDir)) {
+    $resolvedOutputDir = $OutputDir
+}
+else {
+    $resolvedOutputDir = Join-Path $PSScriptRoot $OutputDir
+}
+
+if (-not (Test-Path $resolvedOutputDir -PathType Container)) {
+    New-Item -Path $resolvedOutputDir -ItemType Directory -Force | Out-Null
+}
+
+$safeHost = ($HostName -replace '[^a-zA-Z0-9._-]', '_')
+$ts = Get-Date -Format "yyyyMMdd_HHmmss"
+$reportFile = Join-Path $resolvedOutputDir ("tlsinfo_{0}_{1}_{2}.txt" -f $safeHost, $Port, $ts)
+
+Start-Transcript -Path $reportFile -Force | Out-Null
+$script:transcriptStarted = $true
+
+function Stop-AndExit {
+    param([int]$Code)
+
+    if ($script:transcriptStarted) {
+        try { Stop-Transcript | Out-Null }
+        catch { }
+    }
+
+    if ($Code -eq 0) {
+        Write-Host "Report salvo em: $reportFile" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Report salvo em: $reportFile" -ForegroundColor Yellow
+    }
+
+    exit $Code
+}
 
 Write-Host ""
 Write-Host "============================================================"
@@ -53,39 +96,64 @@ Write-Host "============================================================"
 Write-Host "Host    : $HostName"
 Write-Host "Port    : $Port"
 Write-Host "SNI     : $Sni"
+Write-Host "Protocol: $Protocol"
+Write-Host "Strict  : $($StrictValidation.IsPresent)"
 Write-Host ""
 
 # DNS
+$dnsMs = $null
 try {
+    $dnsSw = [System.Diagnostics.Stopwatch]::StartNew()
     $ips = [System.Net.Dns]::GetHostAddresses($HostName)
+    $dnsSw.Stop()
+    $dnsMs = $dnsSw.ElapsedMilliseconds
     Write-Host "DNS resolvido:" -ForegroundColor DarkGray
     foreach ($ip in $ips) {
         Write-Host "  -> $($ip.IPAddressToString)" -ForegroundColor DarkGray
     }
+    Write-Host ("DNS time: {0} ms" -f $dnsMs) -ForegroundColor DarkGray
 }
 catch {
     Write-Host "DNS falhou: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+    Stop-AndExit 1
 }
 Write-Host ""
 
 # Conectar
 $tcp = New-Object System.Net.Sockets.TcpClient
+$tcpMs = $null
 try {
-    $tcp.Connect($HostName, $Port)
+    $tcpSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $connectTask = $tcp.ConnectAsync($HostName, $Port)
+    if (-not $connectTask.Wait($ConnectTimeoutSeconds * 1000)) {
+        throw "TCP timeout apos $ConnectTimeoutSeconds segundos"
+    }
+    $tcpSw.Stop()
+    $tcpMs = $tcpSw.ElapsedMilliseconds
     Write-Host "TCP conectado em $($tcp.Client.RemoteEndPoint)" -ForegroundColor Green
+    Write-Host ("TCP time: {0} ms" -f $tcpMs) -ForegroundColor DarkGray
 }
 catch {
     Write-Host "TCP falhou: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+    Stop-AndExit 1
 }
 
 # Captura certs no callback de validacao
 $script:capturedChain = @()
+$script:capturedSslPolicyErrors = [System.Net.Security.SslPolicyErrors]::None
+$script:capturedChainStatus = @()
 $validationCallback = {
     param($sender, $cert, $chain, $sslErrors)
+    $script:capturedSslPolicyErrors = $sslErrors
     foreach ($elem in $chain.ChainElements) {
         $script:capturedChain += $elem.Certificate
+    }
+    $script:capturedChainStatus = @()
+    foreach ($st in $chain.ChainStatus) {
+        $script:capturedChainStatus += [pscustomobject]@{
+            Status = $st.Status.ToString()
+            Info   = ($st.StatusInformation -replace "\r|\n", " ").Trim()
+        }
     }
     $true  # aceita para fins de diagnostico
 }
@@ -106,8 +174,12 @@ $sslProtocols = switch ($Protocol) {
 
 $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $validationCallback)
 
+$tlsMs = $null
 try {
+    $tlsSw = [System.Diagnostics.Stopwatch]::StartNew()
     $ssl.AuthenticateAsClient($Sni, $null, $sslProtocols, $true)
+    $tlsSw.Stop()
+    $tlsMs = $tlsSw.ElapsedMilliseconds
 }
 catch {
     Write-Host "TLS handshake falhou: $($_.Exception.Message)" -ForegroundColor Red
@@ -115,7 +187,7 @@ catch {
         Write-Host "  Inner: $($_.Exception.InnerException.Message)" -ForegroundColor Red
     }
     $tcp.Close()
-    exit 1
+    Stop-AndExit 1
 }
 
 Write-Host ""
@@ -127,10 +199,57 @@ Write-Host "============================================================"
 Write-Host "  TLS Session"
 Write-Host "============================================================"
 Write-Host ("  Protocol            : {0}" -f $ssl.SslProtocol)
+Write-Host ("  TLS handshake time  : {0} ms" -f $tlsMs)
 Write-Host ("  Cipher              : {0} ({1} bits)" -f $ssl.CipherAlgorithm, $ssl.CipherStrength)
 Write-Host ("  Hash                : {0} ({1} bits)" -f $ssl.HashAlgorithm, $ssl.HashStrength)
 Write-Host ("  Key exchange        : {0} ({1} bits)" -f $ssl.KeyExchangeAlgorithm, $ssl.KeyExchangeStrength)
 Write-Host ("  Mutually authenticated: {0}" -f $ssl.IsMutuallyAuthenticated)
+Write-Host ""
+
+# Resumo de validacao TLS/certificado
+$certHasIssues = $false
+if ($script:capturedSslPolicyErrors -ne [System.Net.Security.SslPolicyErrors]::None) {
+    $certHasIssues = $true
+}
+
+$chainProblems = @($script:capturedChainStatus | Where-Object { $_.Status -ne "NoError" -and $_.Status -ne "0" })
+if ($chainProblems.Count -gt 0) {
+    $certHasIssues = $true
+}
+
+Write-Host "============================================================"
+Write-Host "  TLS Validation"
+Write-Host "============================================================"
+if (-not $certHasIssues) {
+    Write-Host "  Result              : PASS" -ForegroundColor Green
+}
+else {
+    Write-Host "  Result              : WARNING" -ForegroundColor Yellow
+}
+
+Write-Host ("  SslPolicyErrors     : {0}" -f $script:capturedSslPolicyErrors)
+if ($chainProblems.Count -gt 0) {
+    Write-Host "  ChainStatus         :" -ForegroundColor Yellow
+    foreach ($item in $chainProblems) {
+        if ([string]::IsNullOrWhiteSpace($item.Info)) {
+            Write-Host ("    - {0}" -f $item.Status) -ForegroundColor Yellow
+        }
+        else {
+            Write-Host ("    - {0}: {1}" -f $item.Status, $item.Info) -ForegroundColor Yellow
+        }
+    }
+}
+else {
+    Write-Host "  ChainStatus         : NoError"
+}
+Write-Host ""
+
+Write-Host "============================================================"
+Write-Host "  Stage Timings"
+Write-Host "============================================================"
+Write-Host ("  DNS                : {0} ms" -f $dnsMs)
+Write-Host ("  TCP Connect        : {0} ms" -f $tcpMs)
+Write-Host ("  TLS Handshake      : {0} ms" -f $tlsMs)
 Write-Host ""
 
 # Chain
@@ -176,3 +295,10 @@ Write-Host ""
 Write-Host "  openssl s_client -connect ${HostName}:${Port} -servername $Sni" -ForegroundColor DarkGray
 Write-Host "  curl.exe -v https://${HostName}:${Port}/" -ForegroundColor DarkGray
 Write-Host ""
+
+if ($StrictValidation -and $certHasIssues) {
+    Write-Host "StrictValidation ativo: encerrando com erro devido a problemas de validacao TLS." -ForegroundColor Red
+    Stop-AndExit 2
+}
+
+Stop-AndExit 0

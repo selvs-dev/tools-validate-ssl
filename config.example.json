@@ -2,7 +2,7 @@
   "baseUrl": "https://www.hext.nucleaportabilidade.com.br",
 
   "execution": {
-    "iterations": 100,
+    "iterations": 50,
     "concurrency": 5,
     "timeoutSeconds": 30,
     "forceTls": "Tls12",

@@ -1,0 +1,44 @@
+{
+  "baseUrl": "https://www.hext.nucleaportabilidade.com.br",
+
+  "execution": {
+    "iterations": 100,
+    "concurrency": 5,
+    "timeoutSeconds": 30,
+    "forceTls": "Tls12",
+    "keepAlive": false,
+    "ignoreCertErrors": false,
+    "outputDir": "./logs"
+  },
+
+  "login": {
+    "path": "/evidencia/auth/login",
+    "method": "POST",
+    "tokenField": "token",
+
+    "basicAuth": {
+      "username": "SEU_USERNAME_AQUI",
+      "password": "SUA_SENHA_AQUI"
+    },
+
+    "body": {
+      "ispb": "05328484"
+    }
+  },
+
+  "consume": {
+    "path": "/channel-receiver-js/api/repositorio/consultar-inclusao-evidencia",
+    "method": "POST",
+
+    "headers": {
+      "X-CIP-Logical-Id":  "CIE",
+      "X-CIP-Operator-Id": "02992335",
+      "X-CIP-Party-Id":    "05328484"
+    },
+
+    "body": {
+      "numControleEvidencia": "123",
+      "tipoConsulta": "RETENCAO"
+    }
+  }
+}

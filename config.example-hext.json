@@ -1,5 +1,5 @@
 {
-  "baseUrl": "https://SEU_HOST_AQUI",
+  "baseUrl": "https://www.hext.nucleaportabilidade.com.br",
 
   "execution": {
     "iterations": 50,
@@ -12,7 +12,7 @@
   },
 
   "login": {
-    "path": "/auth/login",
+    "path": "/evidencia/auth/login",
     "method": "POST",
     "tokenField": "token",
 
@@ -22,16 +22,23 @@
     },
 
     "body": {
-      "campoExemplo": "valor"
+      "ispb": "05328484"
     }
   },
 
   "consume": {
-    "path": "/api/recurso",
+    "path": "/channel-receiver-js/api/repositorio/consultar-inclusao-evidencia",
     "method": "POST",
 
+    "headers": {
+      "X-CIP-Logical-Id":  "CIE",
+      "X-CIP-Operator-Id": "02992335",
+      "X-CIP-Party-Id":    "05328484"
+    },
+
     "body": {
-      "campoConsulta": "valor"
+      "numControleEvidencia": "123",
+      "tipoConsulta": "RETENCAO"
     }
   }
 }
